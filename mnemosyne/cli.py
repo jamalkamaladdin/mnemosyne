@@ -1268,23 +1268,35 @@ def cmd_bank(args):
 
 
 def _resolve_reindex_target(db_override, bank_override):
-    """Resolve the (db_path, bank_name) reindex should open, honoring --db/--bank.
+    """Resolve the database path reindex should open, honoring --db/--bank.
 
-    Mirrors ``_get_memory()``'s bank resolution (via ``BankManager``, which
-    may create the bank on first use) but also honors an explicit ``--db``
-    path, which ``_get_memory()`` has no way to accept.
+    An explicit ``--db`` or ``--bank`` target must already exist. It is
+    looked up without touching the filesystem, so a typo exits before any
+    store, bank directory or backup is created. Without a target this mirrors
+    ``_get_memory()``'s ambient bank resolution.
     """
     if db_override is not None:
-        return Path(db_override).expanduser(), "default"
-    bank_name = _resolve_bank_name(bank_override)
-    from mnemosyne.core.banks import BankManager
+        db_path = Path(db_override).expanduser()
+    elif bank_override is not None:
+        from mnemosyne.core.banks import get_bank_db_path_read_only
 
-    bm = BankManager(Path(DATA_DIR))
-    try:
-        db_path = bm.get_bank_db_path(bank_name)
-    except ValueError as error:
-        _fail(str(error))
-    return db_path, bank_name
+        try:
+            db_path = get_bank_db_path_read_only(
+                _resolve_bank_name(bank_override), data_dir=Path(DATA_DIR)
+            )
+        except (ValueError, FileNotFoundError) as error:
+            _fail(str(error))
+    else:
+        from mnemosyne.core.banks import BankManager
+
+        bm = BankManager(Path(DATA_DIR))
+        try:
+            return bm.get_bank_db_path(_resolve_bank_name())
+        except ValueError as error:
+            _fail(str(error))
+    if not db_path.is_file():
+        _fail(f"Database not found: {db_path}")
+    return db_path
 
 
 def cmd_reindex(args):
@@ -1331,19 +1343,23 @@ def cmd_reindex(args):
     if db_override is not None and bank_override is not None:
         _fail("--db and --bank cannot be used together")
 
+    db_path = _resolve_reindex_target(db_override, bank_override)
+
     # --model has to win before the embedding module is imported: it freezes the
     # model + dimension from the env at import time.
     if model_override is not None:
         os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = model_override
 
     from mnemosyne.core import embeddings as _emb
-    from mnemosyne.core.memory import Mnemosyne
+    # Open the target through BeamMemory, not Mnemosyne: importing
+    # mnemosyne.core.memory runs init_db() on the ambient default database,
+    # which a targeted reindex must leave untouched.
+    from mnemosyne.core.beam import BeamMemory, reindex_vectors
 
-    db_path, bank_name = _resolve_reindex_target(db_override, bank_override)
-    mem = Mnemosyne(db_path=str(db_path), bank=bank_name)
+    beam = BeamMemory(db_path=str(db_path))
 
     if dry_run:
-        plan = mem.reindex_vectors(dry_run=True)
+        plan = reindex_vectors(beam.conn, dry_run=True)
         print(f"Reindex plan (dry run -- nothing written), db: {db_path}")
         for key in ("model", "dim", "vec_type", "sqlite_vec",
                     "working_memory", "episodic_memory"):
@@ -1381,7 +1397,7 @@ def cmd_reindex(args):
         print(f"  {store}: {done}/{total}", flush=True)
 
     try:
-        result = mem.reindex_vectors(progress=_progress)
+        result = reindex_vectors(beam.conn, progress=_progress)
     except Exception as e:
         _fail(str(e))
 
@@ -1930,7 +1946,7 @@ def run_cli():
         print("  import <file.json>                     Import memories")
         print("  import-hindsight <file|url> [bank]     Import Hindsight memories")
         print("  bank list|create|delete [name]         Manage memory banks")
-        print("  reindex [--model NAME] [--dry-run] [--yes] [--no-backup]")
+        print("  reindex [--db PATH|--bank NAME] [--model NAME] [--dry-run] [--yes] [--no-backup]")
         print("                                      Rebuild vector indexes with the active model")
         print("  backup [output_dir]                    Create database backup")
         print("  restore <backup.db.gz>                 Restore from backup")
@@ -1961,7 +1977,7 @@ def run_cli():
         # machine-readable code, never a traceback (which leaks absolute
         # paths and library internals into logs).
         try:
-            if command not in {"doctor", "repair"}:
+            if command not in {"doctor", "repair", "reindex"}:
                 os.makedirs(DATA_DIR, exist_ok=True)
             handler(sys.argv[2:])
         except SystemExit:
