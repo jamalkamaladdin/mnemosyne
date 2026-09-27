@@ -9,6 +9,7 @@ import io
 import os
 import json
 import hashlib
+import secrets
 import shutil
 import sqlite3
 from datetime import datetime
@@ -21,7 +22,7 @@ _BACKUP_SUFFIX = ".db.gz"
 # <backup_dir>/stores/<db stem>-<digest>/. The default directory's listing,
 # rotation and emergency restore glob non-recursively, so they never see them.
 _STORE_BACKUPS_DIRNAME = "stores"
-_STORE_DIGEST_CHARS = 8
+_STORE_DIGEST_CHARS = 32
 # Numbered suffixes _01.._99 keep same-microsecond names in creation order.
 _MAX_NAME_ATTEMPTS = 100
 
@@ -71,26 +72,64 @@ def _store_backup_dir(db_path: Path, backup_root: Path, default_db: Path) -> Pat
     return backup_root / _STORE_BACKUPS_DIRNAME / f"{source.stem}-{digest}"
 
 
+def _publish_backup(tmp_path: Path, backup_path: Path) -> None:
+    """Give the finished ``tmp_path`` the additional name ``backup_path``.
+
+    Raises ``FileExistsError`` when ``backup_path`` is taken; an existing file
+    is never replaced. A hard link publishes the complete file in one step.
+    Where hard links are not supported, an exclusive copy is made and removed
+    again if the copy fails.
+    """
+    try:
+        os.link(tmp_path, backup_path)
+        return
+    except FileExistsError:
+        raise
+    except OSError:
+        pass
+    with open(tmp_path, "rb") as src, open(backup_path, "xb") as dst:
+        try:
+            shutil.copyfileobj(src, dst)
+            dst.flush()
+            os.fsync(dst.fileno())
+        except BaseException:
+            dst.close()
+            backup_path.unlink(missing_ok=True)
+            raise
+
+
 def _write_new_backup(backup_dir: Path, stamp: str, payload: bytes) -> Path:
     """Gzip ``payload`` into a backup file that did not exist before.
 
-    The file is created exclusively (mode ``"xb"``). A name that is already
-    taken gets a numbered suffix instead of being replaced.
+    The gzip stream goes to a hidden temporary file that the backup globs do
+    not match. Only a stream that was written and closed without error gets a
+    backup name, so a failed write leaves nothing for listing, rotation or
+    restore to pick up. A name that is already taken gets a numbered suffix
+    instead of being replaced.
     """
-    for attempt in range(_MAX_NAME_ATTEMPTS):
-        suffix = f"_{attempt:02d}" if attempt else ""
-        backup_path = backup_dir / f"{_BACKUP_PREFIX}{stamp}{suffix}{_BACKUP_SUFFIX}"
-        try:
-            raw = open(backup_path, "xb")
-        except FileExistsError:
-            continue
-        with raw, gzip.GzipFile(fileobj=raw, mode="wb") as f_out:
-            f_out.write(payload)
-        return backup_path
-    raise FileExistsError(
-        f"No free backup name for {stamp} in {backup_dir} "
-        f"after {_MAX_NAME_ATTEMPTS} attempts"
-    )
+    tmp_path = backup_dir / f".{_BACKUP_PREFIX}{stamp}_{secrets.token_hex(8)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = os.open(tmp_path, flags, 0o666)
+    try:
+        with os.fdopen(fd, "wb") as raw:
+            with gzip.GzipFile(fileobj=raw, mode="wb") as f_out:
+                f_out.write(payload)
+            raw.flush()
+            os.fsync(raw.fileno())
+        for attempt in range(_MAX_NAME_ATTEMPTS):
+            suffix = f"_{attempt:02d}" if attempt else ""
+            backup_path = backup_dir / f"{_BACKUP_PREFIX}{stamp}{suffix}{_BACKUP_SUFFIX}"
+            try:
+                _publish_backup(tmp_path, backup_path)
+            except FileExistsError:
+                continue
+            return backup_path
+        raise FileExistsError(
+            f"No free backup name for {stamp} in {backup_dir} "
+            f"after {_MAX_NAME_ATTEMPTS} attempts"
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
@@ -228,9 +267,22 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
     }
 
 
+def _recorded_source(backup: Path):
+    """Return the ``source_db`` recorded in the metadata of ``backup``, or None."""
+    try:
+        with open(backup.with_suffix(".gz.json")) as f:
+            source = json.load(f).get("source_db")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return source if isinstance(source, str) else None
+
+
 def emergency_restore(backup_dir: Path = None, db_path: Path = None) -> Dict:
     """
     Automatically restore from the most recent valid backup.
+
+    Backups whose metadata records a ``source_db`` other than ``db_path`` are
+    never selected. Backups without a recorded source stay eligible.
     
     Returns:
         Dict with restore status
@@ -238,9 +290,14 @@ def emergency_restore(backup_dir: Path = None, db_path: Path = None) -> Dict:
     _, default_backup_dir, default_db = get_default_paths()
     backup_dir = backup_dir or default_backup_dir
     db_path = db_path or default_db
+    target = str(_resolved(db_path))
     
-    # Find all backups
-    backups = sorted(backup_dir.glob("mnemosyne_backup_*.db.gz"), reverse=True)
+    # Find all backups of this database
+    backups = [
+        backup
+        for backup in sorted(backup_dir.glob("mnemosyne_backup_*.db.gz"), reverse=True)
+        if _recorded_source(backup) in (None, target)
+    ]
     
     if not backups:
         raise FileNotFoundError("No backups found in " + str(backup_dir))

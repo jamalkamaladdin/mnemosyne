@@ -19,6 +19,8 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 from mnemosyne import cli
 from mnemosyne.core import beam
 from mnemosyne.dr import recovery
@@ -64,6 +66,11 @@ def _dump(path) -> str:
         return f.read()
 
 
+def _store_dir(backup_root: Path, db: Path) -> Path:
+    digest = hashlib.sha256(os.fsencode(str(db.resolve()))).hexdigest()[:32]
+    return backup_root / "stores" / f"{db.stem}-{digest}"
+
+
 def test_same_second_backups_of_one_store_both_survive(monkeypatch, tmp_path):
     backup_root, default_db = _isolate(monkeypatch, tmp_path)
     _make_store(default_db, "first")
@@ -104,8 +111,7 @@ def test_targeted_reindex_backup_stays_out_of_default_backups(monkeypatch, tmp_p
 
     cli.cmd_reindex(["--db", str(other_db), "--yes"])
 
-    digest = hashlib.sha256(os.fsencode(str(other_db.resolve()))).hexdigest()[:8]
-    store_dir = backup_root / "stores" / f"work-{digest}"
+    store_dir = _store_dir(backup_root, other_db)
     targeted = sorted(store_dir.glob("mnemosyne_backup_*.db.gz"))
     assert len(targeted) == 1
     assert f"Backup created: {targeted[0]}" in capsys.readouterr().out
@@ -146,3 +152,104 @@ def test_default_store_backup_location_and_listing_unchanged(monkeypatch, tmp_pa
         default_db.resolve()
     )
     assert [b["name"] for b in recovery.list_backups()] == [backup_path.name, legacy.name]
+
+
+class _FailingWrite(gzip.GzipFile):
+    def write(self, data):
+        raise OSError("disk full")
+
+
+class _FailingClose(gzip.GzipFile):
+    _failed = False
+
+    def close(self):
+        super().close()
+        if not self._failed:
+            self._failed = True
+            raise OSError("disk full")
+
+
+@pytest.mark.parametrize("failing_gzip", [_FailingWrite, _FailingClose])
+def test_failed_backup_write_leaves_no_backup_for_rotation(
+    monkeypatch, tmp_path, failing_gzip
+):
+    backup_root, default_db = _isolate(monkeypatch, tmp_path)
+    _make_store(default_db, "default")
+    _freeze_clock(
+        monkeypatch,
+        datetime(2026, 9, 27, 12, 0, 0, 0),
+        datetime(2026, 9, 27, 12, 0, 1, 0),
+    )
+    good = recovery.create_backup()
+
+    with monkeypatch.context() as patched:
+        patched.setattr(recovery.gzip, "GzipFile", failing_gzip)
+        with pytest.raises(OSError, match="disk full"):
+            recovery.create_backup()
+
+    assert sorted(p.name for p in backup_root.iterdir()) == sorted(
+        [Path(good["backup_path"]).name, Path(good["metadata_path"]).name]
+    )
+    rotated = recovery.rotate_backups(backup_dir=backup_root, keep=1)
+    assert rotated["deleted"] == 0
+    assert Path(good["backup_path"]).is_file()
+
+
+def test_targeted_bank_backups_get_one_directory_per_store(monkeypatch, tmp_path):
+    backup_root, default_db = _isolate(monkeypatch, tmp_path)
+    data_dir = default_db.parent
+    monkeypatch.setattr(cli, "DATA_DIR", str(data_dir))
+    _make_store(default_db, "default")
+    work = _make_store(data_dir / "banks" / "work" / "mnemosyne.db", "work")
+    home = _make_store(data_dir / "banks" / "home" / "mnemosyne.db", "home")
+    monkeypatch.setattr(
+        beam,
+        "reindex_vectors",
+        lambda conn, progress=None: {"model": "fake", "dim": 4},
+    )
+
+    cli.cmd_reindex(["--bank", "work", "--yes"])
+    cli.cmd_reindex(["--bank", "home", "--yes"])
+
+    work_dir = _store_dir(backup_root, work)
+    home_dir = _store_dir(backup_root, home)
+    assert work_dir != home_dir
+    for store_dir, db in ((work_dir, work), (home_dir, home)):
+        backups = sorted(store_dir.glob("mnemosyne_backup_*.db.gz"))
+        assert len(backups) == 1
+        meta = json.loads(backups[0].with_suffix(".gz.json").read_text())
+        assert meta["source_db"] == str(db.resolve())
+    assert recovery.list_backups() == []
+
+
+def test_explicit_backup_dir_is_used_as_given(monkeypatch, tmp_path):
+    backup_root, default_db = _isolate(monkeypatch, tmp_path)
+    other_db = _make_store(tmp_path / "elsewhere" / "work.db", "other")
+    explicit = tmp_path / "chosen"
+
+    result = recovery.create_backup(db_path=other_db, backup_dir=explicit)
+
+    assert Path(result["backup_path"]).parent == explicit
+    assert result["source_db"] == str(other_db.resolve())
+    assert not backup_root.exists()
+
+
+def test_emergency_restore_skips_backups_of_another_store(monkeypatch, tmp_path):
+    backup_root, default_db = _isolate(monkeypatch, tmp_path)
+    _make_store(default_db, "default")
+    other_db = _make_store(tmp_path / "elsewhere" / "work.db", "other")
+    _freeze_clock(
+        monkeypatch,
+        datetime(2026, 9, 27, 12, 0, 0, 0),
+        datetime(2026, 9, 27, 12, 0, 1, 0),
+    )
+    default_backup = recovery.create_backup()
+    foreign = recovery.create_backup(db_path=other_db, backup_dir=backup_root)
+
+    restored = recovery.emergency_restore()
+
+    assert restored["backup_used"] == default_backup["backup_path"]
+    assert Path(foreign["backup_path"]).is_file()
+    conn = sqlite3.connect(str(default_db))
+    assert conn.execute("SELECT label FROM marker").fetchall() == [("default",)]
+    conn.close()
