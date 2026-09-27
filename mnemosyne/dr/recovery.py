@@ -281,8 +281,10 @@ def emergency_restore(backup_dir: Path = None, db_path: Path = None) -> Dict:
     """
     Automatically restore from the most recent valid backup.
 
-    Backups whose metadata records a ``source_db`` other than ``db_path`` are
-    never selected. Backups without a recorded source stay eligible.
+    Only backups whose metadata records ``db_path`` as ``source_db`` are
+    selected. Backups without a recorded source, such as files written before
+    ``source_db`` existed, stay on disk and are never selected automatically;
+    restore one of them explicitly with ``restore_backup``.
     
     Returns:
         Dict with restore status
@@ -293,13 +295,18 @@ def emergency_restore(backup_dir: Path = None, db_path: Path = None) -> Dict:
     target = str(_resolved(db_path))
     
     # Find all backups of this database
-    backups = [
-        backup
-        for backup in sorted(backup_dir.glob("mnemosyne_backup_*.db.gz"), reverse=True)
-        if _recorded_source(backup) in (None, target)
-    ]
+    candidates = sorted(backup_dir.glob("mnemosyne_backup_*.db.gz"), reverse=True)
+    sources = {backup: _recorded_source(backup) for backup in candidates}
+    backups = [backup for backup in candidates if sources[backup] == target]
     
     if not backups:
+        unverified = sum(1 for backup in candidates if sources[backup] is None)
+        if unverified:
+            raise FileNotFoundError(
+                f"No backups of {target} found in {backup_dir}; {unverified} "
+                "backup(s) there have no recorded source_db and need an "
+                "explicit restore"
+            )
         raise FileNotFoundError("No backups found in " + str(backup_dir))
     
     # Try each backup until one works

@@ -253,3 +253,55 @@ def test_emergency_restore_skips_backups_of_another_store(monkeypatch, tmp_path)
     conn = sqlite3.connect(str(default_db))
     assert conn.execute("SELECT label FROM marker").fetchall() == [("default",)]
     conn.close()
+
+
+def _legacy_backup(backup_root: Path, name: str, label: str) -> Path:
+    """A backup as written before ``source_db`` existed: no metadata file."""
+    backup_root.mkdir(parents=True, exist_ok=True)
+    legacy = backup_root / name
+    dump = (
+        "BEGIN TRANSACTION;\n"
+        "CREATE TABLE marker (label TEXT);\n"
+        f"INSERT INTO marker VALUES('{label}');\n"
+        "COMMIT;\n"
+    )
+    legacy.write_bytes(gzip.compress(dump.encode("utf-8")))
+    return legacy
+
+
+def test_emergency_restore_never_selects_backups_without_source(monkeypatch, tmp_path):
+    backup_root, default_db = _isolate(monkeypatch, tmp_path)
+    _make_store(default_db, "default")
+    _freeze_clock(monkeypatch, datetime(2026, 1, 1, 0, 0, 0, 0))
+    verified = recovery.create_backup()
+    legacy = _legacy_backup(backup_root, "mnemosyne_backup_20260927_120000.db.gz", "legacy")
+
+    restored = recovery.emergency_restore()
+
+    assert restored["backup_used"] == verified["backup_path"]
+    assert legacy.is_file()
+    conn = sqlite3.connect(str(default_db))
+    assert conn.execute("SELECT label FROM marker").fetchall() == [("default",)]
+    conn.close()
+
+
+def test_emergency_restore_with_only_unverified_backups_restores_nothing(
+    monkeypatch, tmp_path
+):
+    backup_root, default_db = _isolate(monkeypatch, tmp_path)
+    _make_store(default_db, "default")
+    legacy = _legacy_backup(backup_root, "mnemosyne_backup_20260927_120000.db.gz", "legacy")
+
+    with pytest.raises(FileNotFoundError, match="1 backup\\(s\\) there have no recorded source_db"):
+        recovery.emergency_restore()
+
+    assert legacy.is_file()
+    conn = sqlite3.connect(str(default_db))
+    assert conn.execute("SELECT label FROM marker").fetchall() == [("default",)]
+    conn.close()
+
+    restored = recovery.restore_backup(legacy)
+    assert restored["integrity_check"]
+    conn = sqlite3.connect(str(default_db))
+    assert conn.execute("SELECT label FROM marker").fetchall() == [("legacy",)]
+    conn.close()
