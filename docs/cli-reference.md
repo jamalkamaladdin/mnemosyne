@@ -47,6 +47,8 @@ For automation, do not treat a non-zero exit from a non-dry-run `mnemosyne reind
 | `restore` | `restore <backup.db.gz>` |
 | `backups` | `backups [backup_dir]`. List available snapshots |
 
+`reindex --db` and `reindex --bank` back up their target to `<backup dir>/stores/<db stem>-<first 32 hex of the sha256 of the resolved path>/`, and each `.gz.json` file names the source database in `source_db`. `backups`, rotation, the health check and emergency restore read only the backup directory they are given, so they do not list, rotate or pick these snapshots. `backups <store dir>` lists them, and `mnemosyne.dr.recovery.rotate_backups(backup_dir=Path(store_dir))` rotates them. `restore` always writes to the default database; restore a targeted store with `mnemosyne.dr.recovery.restore_backup(Path(backup), db_path=Path(store))`.
+
 ## Import and export
 
 | Command | Usage |
