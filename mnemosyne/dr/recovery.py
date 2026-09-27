@@ -15,6 +15,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
+_BACKUP_PREFIX = "mnemosyne_backup_"
+_BACKUP_SUFFIX = ".db.gz"
+# Backups of a store other than the default one go to
+# <backup_dir>/stores/<db stem>-<digest>/. The default directory's listing,
+# rotation and emergency restore glob non-recursively, so they never see them.
+_STORE_BACKUPS_DIRNAME = "stores"
+_STORE_DIGEST_CHARS = 8
+# Numbered suffixes _01.._99 keep same-microsecond names in creation order.
+_MAX_NAME_ATTEMPTS = 100
+
 
 def get_default_paths():
     """Get default Mnemosyne paths.
@@ -43,25 +53,70 @@ def get_default_paths():
     return data_dir, backup_dir, db_path
 
 
+def _resolved(path: Path) -> Path:
+    return Path(path).expanduser().resolve()
+
+
+def _store_backup_dir(db_path: Path, backup_root: Path, default_db: Path) -> Path:
+    """Return the directory for automatic backups of ``db_path``.
+
+    The default store keeps ``backup_root``. Any other store gets its own
+    subdirectory named after its file stem and a digest of its resolved path,
+    so backups of different stores never share a directory or a filename.
+    """
+    source = _resolved(db_path)
+    if source == _resolved(default_db):
+        return backup_root
+    digest = hashlib.sha256(os.fsencode(str(source))).hexdigest()[:_STORE_DIGEST_CHARS]
+    return backup_root / _STORE_BACKUPS_DIRNAME / f"{source.stem}-{digest}"
+
+
+def _write_new_backup(backup_dir: Path, stamp: str, payload: bytes) -> Path:
+    """Gzip ``payload`` into a backup file that did not exist before.
+
+    The file is created exclusively (mode ``"xb"``). A name that is already
+    taken gets a numbered suffix instead of being replaced.
+    """
+    for attempt in range(_MAX_NAME_ATTEMPTS):
+        suffix = f"_{attempt:02d}" if attempt else ""
+        backup_path = backup_dir / f"{_BACKUP_PREFIX}{stamp}{suffix}{_BACKUP_SUFFIX}"
+        try:
+            raw = open(backup_path, "xb")
+        except FileExistsError:
+            continue
+        with raw, gzip.GzipFile(fileobj=raw, mode="wb") as f_out:
+            f_out.write(payload)
+        return backup_path
+    raise FileExistsError(
+        f"No free backup name for {stamp} in {backup_dir} "
+        f"after {_MAX_NAME_ATTEMPTS} attempts"
+    )
+
+
 def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
     """
     Create a compressed backup of the database.
+
+    Without ``backup_dir``, backups of the default database go to the default
+    backup directory and backups of any other database go to its own
+    ``stores/<stem>-<digest>`` subdirectory there. Backup names carry
+    microseconds and are never overwritten.
     
     Returns:
-        Dict with backup_path, size, checksum, and timestamp
+        Dict with backup_path, size, checksum, timestamp and source_db
     """
     _, default_backup_dir, default_db = get_default_paths()
     db_path = db_path or default_db
-    backup_dir = backup_dir or default_backup_dir
+    if backup_dir is None:
+        backup_dir = _store_backup_dir(db_path, default_backup_dir, default_db)
     
     if not db_path.exists():
         raise FileNotFoundError(f"Database not found: {db_path}")
     
     backup_dir.mkdir(parents=True, exist_ok=True)
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_name = f"mnemosyne_backup_{timestamp}.db.gz"
-    backup_path = backup_dir / backup_name
+    now = datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
     
     # Use sqlite3 online backup API instead of shutil.copyfileobj.
     # sqlite3.backup() is lock-aware (acquires read-lock), includes
@@ -95,8 +150,9 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
         buf.write((line + "\n").encode("utf-8"))
     dst.close()
 
-    with gzip.open(backup_path, "wb") as f_out:
-        f_out.write(buf.getvalue())
+    backup_path = _write_new_backup(
+        backup_dir, now.strftime("%Y%m%d_%H%M%S_%f"), buf.getvalue()
+    )
     
     # Calculate checksums
     db_checksum = hashlib.sha256(db_path.read_bytes()).hexdigest()[:16]
@@ -109,7 +165,8 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
         "backup_size": backup_path.stat().st_size,
         "db_checksum": db_checksum,
         "backup_checksum": backup_checksum,
-        "compressed": True
+        "compressed": True,
+        "source_db": str(_resolved(db_path)),
     }
     
     # Save metadata
