@@ -565,8 +565,9 @@ def emergency_restore(backup_dir: Path = None, db_path: Path = None) -> Dict:
 
     Only backups whose metadata records ``db_path`` as ``source_db`` are
     selected. Backups without a recorded source, such as files written before
-    ``source_db`` existed, stay on disk and are never selected automatically;
-    restore one of them explicitly with ``restore_backup``.
+    ``source_db`` existed, stay on disk and are never selected automatically.
+    ``restore_backup`` accepts one only when its metadata sidecar is present
+    and checksum-verifiable; a backup without a sidecar is refused.
 
     Returns:
         Dict with restore status

@@ -285,7 +285,7 @@ def test_emergency_restore_never_selects_backups_without_source(monkeypatch, tmp
     conn.close()
 
 
-def test_emergency_restore_with_only_unverified_backups_restores_nothing(
+def test_unverified_backups_are_never_selected_or_restored(
     monkeypatch, tmp_path
 ):
     backup_root, default_db = _isolate(monkeypatch, tmp_path)
@@ -300,8 +300,13 @@ def test_emergency_restore_with_only_unverified_backups_restores_nothing(
     assert conn.execute("SELECT label FROM marker").fetchall() == [("default",)]
     conn.close()
 
-    restored = recovery.restore_backup(legacy)
-    assert restored["integrity_check"]
+    # A backup with no metadata sidecar has no recorded checksums to verify
+    # against, so restore refuses it outright (the fail-closed contract pinned
+    # by test_missing_metadata_sidecar_rejected_and_target_preserved).
+    with pytest.raises(RuntimeError, match="Backup metadata sidecar not found"):
+        recovery.restore_backup(legacy)
+
+    assert legacy.is_file()
     conn = sqlite3.connect(str(default_db))
-    assert conn.execute("SELECT label FROM marker").fetchall() == [("legacy",)]
+    assert conn.execute("SELECT label FROM marker").fetchall() == [("default",)]
     conn.close()
