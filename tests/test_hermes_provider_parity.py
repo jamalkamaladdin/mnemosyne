@@ -24,6 +24,10 @@ def _drop_modules(prefix: str) -> None:
 
 
 def _import_module(package: str, import_root: Path):
+    saved_package_modules = {
+        name: module for name, module in sys.modules.items()
+        if name == package or name.startswith(f"{package}.")
+    }
     _drop_modules(package)
     saved_mnemosyne_modules = {
         name: module for name, module in sys.modules.items()
@@ -47,6 +51,10 @@ def _import_module(package: str, import_root: Path):
             if name == "mnemosyne" or name.startswith("mnemosyne."):
                 sys.modules.pop(name, None)
         sys.modules.update(saved_mnemosyne_modules)
+        for name in list(sys.modules):
+            if name == package or name.startswith(f"{package}."):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_package_modules)
 
 
 @pytest.fixture(scope="module")
@@ -72,6 +80,23 @@ def _tool_schemas(module):
 def _config_schema(module):
     provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
     return {entry["key"]: entry for entry in provider.get_config_schema()}
+
+
+def test_import_module_restores_prior_package_identity():
+    """_import_module must not leave an unrelated caller bound to a stale module.
+
+    Regression for #981: a module pre-imported outside this helper kept
+    pointing at its own module object both before and after _import_module
+    swapped mnemosyne_hermes in and out of sys.modules.
+    """
+    import mnemosyne_hermes as pre_import
+
+    before = sys.modules["mnemosyne_hermes"]
+    _import_module("mnemosyne_hermes", INTEGRATION_SRC)
+    after = sys.modules["mnemosyne_hermes"]
+
+    assert after is before
+    assert pre_import is sys.modules["mnemosyne_hermes"]
 
 
 def _write_mnemosyne_config(hermes_home: Path, tools) -> None:
@@ -2206,6 +2231,10 @@ def test_packaged_provider_import_survives_missing_core_helpers():
 
     finder = _BlockCoreHelperImports()
     saved = {name: module for name, module in sys.modules.items() if name in blocked}
+    saved_mnemosyne_hermes = {
+        name: module for name, module in sys.modules.items()
+        if name == "mnemosyne_hermes" or name.startswith("mnemosyne_hermes.")
+    }
     for name in blocked:
         sys.modules.pop(name, None)
     _drop_modules("mnemosyne_hermes")
@@ -2231,7 +2260,7 @@ def test_packaged_provider_import_survives_missing_core_helpers():
         assert provider._with_persona_block("base") == "base"
     finally:
         _drop_modules("mnemosyne_hermes")
-        _import_module("mnemosyne_hermes", INTEGRATION_SRC)
+        sys.modules.update(saved_mnemosyne_hermes)
 
 
 def _save_mnemosyne_modules():
