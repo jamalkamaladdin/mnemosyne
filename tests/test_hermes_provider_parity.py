@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.abc
 import json
 import sys
 import threading
@@ -24,11 +25,15 @@ def _drop_modules(prefix: str) -> None:
 
 
 def _import_module(package: str, import_root: Path):
+    # Swap the whole top-level package, not only a dotted target: importing
+    # ``pkg.sub`` imports ``pkg`` and binds ``sub`` as an attribute of it, so a
+    # partial restore leaves the saved parent pointing at the temporary module.
+    top_level = package.partition(".")[0]
     saved_package_modules = {
         name: module for name, module in sys.modules.items()
-        if name == package or name.startswith(f"{package}.")
+        if name == top_level or name.startswith(f"{top_level}.")
     }
-    _drop_modules(package)
+    _drop_modules(top_level)
     saved_mnemosyne_modules = {
         name: module for name, module in sys.modules.items()
         if name == "mnemosyne" or name.startswith("mnemosyne.")
@@ -51,9 +56,7 @@ def _import_module(package: str, import_root: Path):
             if name == "mnemosyne" or name.startswith("mnemosyne."):
                 sys.modules.pop(name, None)
         sys.modules.update(saved_mnemosyne_modules)
-        for name in list(sys.modules):
-            if name == package or name.startswith(f"{package}."):
-                sys.modules.pop(name, None)
+        _drop_modules(top_level)
         sys.modules.update(saved_package_modules)
 
 
@@ -99,6 +102,89 @@ def test_import_module_restores_prior_package_identity():
     assert after is before
     assert pre_import is sys.modules["mnemosyne_hermes"]
     assert pre_cli is sys.modules["mnemosyne_hermes.cli"]
+
+
+def _module_tree(prefix: str) -> dict:
+    return {
+        name: module for name, module in sys.modules.items()
+        if name == prefix or name.startswith(f"{prefix}.")
+    }
+
+
+class _FailImport(importlib.abc.MetaPathFinder):
+    def __init__(self, fullname: str):
+        self.fullname = fullname
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == self.fullname:
+            raise ModuleNotFoundError(f"blocked test import: {fullname}")
+        return None
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure"])
+@pytest.mark.parametrize("prior", ["pre_imported", "absent"])
+@pytest.mark.parametrize(
+    ("package", "import_root"),
+    [
+        ("hermes_memory_provider", PROJECT_ROOT),
+        ("hermes_memory_provider.sync_adapter", PROJECT_ROOT),
+        ("mnemosyne_hermes", INTEGRATION_SRC),
+        ("mnemosyne_hermes.sync_adapter", INTEGRATION_SRC),
+    ],
+)
+def test_import_module_restores_package_tree_and_parent_bindings(package, import_root, prior, outcome):
+    """_import_module leaves sys.modules and parent attributes as it found them.
+
+    Importing ``pkg.sub`` binds ``sub`` on the parent package, so restoring
+    only the ``sys.modules`` entries left the saved parent's attribute pointing
+    at the temporary submodule.
+    """
+    top_level = package.partition(".")[0]
+    outer_tree = _module_tree(top_level)
+    outer_mnemosyne = _module_tree("mnemosyne")
+    _drop_modules(top_level)
+    try:
+        if prior == "pre_imported":
+            paths = [str(import_root), str(PROJECT_ROOT)]
+            sys.path[:0] = paths
+            try:
+                importlib.import_module(package)
+            finally:
+                del sys.path[:len(paths)]
+        before = _module_tree(top_level)
+        before_mnemosyne = _module_tree("mnemosyne")
+        parent_bindings = {
+            name: getattr(sys.modules[name.rpartition(".")[0]], name.rpartition(".")[2], None)
+            for name in before if "." in name
+        }
+
+        if outcome == "success":
+            fresh = _import_module(package, import_root)
+            assert fresh is not before.get(package)
+            assert Path(fresh.__file__).is_relative_to(import_root)
+        else:
+            finder = _FailImport(package)
+            sys.meta_path.insert(0, finder)
+            try:
+                with pytest.raises(ModuleNotFoundError, match="blocked test import"):
+                    _import_module(package, import_root)
+            finally:
+                sys.meta_path.remove(finder)
+
+        after = _module_tree(top_level)
+        assert after.keys() == before.keys()
+        assert all(after[name] is before[name] for name in before)
+        for name, module in parent_bindings.items():
+            parent, _, child = name.rpartition(".")
+            assert getattr(sys.modules[parent], child, None) is module
+            assert module is sys.modules[name]
+        assert _module_tree("mnemosyne").keys() == before_mnemosyne.keys()
+        assert all(sys.modules[name] is module for name, module in before_mnemosyne.items())
+    finally:
+        _drop_modules(top_level)
+        sys.modules.update(outer_tree)
+        _drop_modules("mnemosyne")
+        sys.modules.update(outer_mnemosyne)
 
 
 def _write_mnemosyne_config(hermes_home: Path, tools) -> None:
