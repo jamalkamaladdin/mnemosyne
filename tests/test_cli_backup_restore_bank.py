@@ -13,12 +13,16 @@ import hashlib
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from mnemosyne import cli
 from mnemosyne.dr import recovery
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture
@@ -145,3 +149,77 @@ def test_missing_bank_fails_before_writing(stores, monkeypatch, tmp_path, capsys
     assert not backup_root.exists()
     assert default_db.read_bytes() == default_bytes
     assert work_db.read_bytes() == work_bytes
+
+
+def _run_cli(args, tmp_path, data_dir, bank):
+    env = os.environ.copy()
+    env["HOME"] = str(tmp_path / "home")
+    env["MNEMOSYNE_NO_EMBEDDINGS"] = "1"
+    env["MNEMOSYNE_DATA_DIR"] = str(data_dir)
+    env["MNEMOSYNE_BACKUP_DIR"] = str(tmp_path / "backups")
+    env["MNEMOSYNE_BANK"] = bank
+    env.pop("HERMES_HOME", None)
+    return subprocess.run(
+        [sys.executable, "-m", "mnemosyne.cli", *args],
+        cwd=str(ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def _snapshot(tmp_path) -> dict:
+    source = _make_store(tmp_path / "snapshot" / "source.db", "restored")
+    return recovery.create_backup(db_path=source, backup_dir=tmp_path / "out")
+
+
+def test_cli_restore_into_existing_bank_without_database(tmp_path):
+    data_dir = tmp_path / "data"
+    default_db = _make_store(data_dir / "mnemosyne.db", "default")
+    other_db = _make_store(data_dir / "banks" / "other" / "mnemosyne.db", "other")
+    work_dir = data_dir / "banks" / "work"
+    work_dir.mkdir(parents=True)
+    backup = _snapshot(tmp_path)
+    default_bytes = default_db.read_bytes()
+    other_bytes = other_db.read_bytes()
+
+    result = _run_cli(["restore", backup["backup_path"]], tmp_path, data_dir, "work")
+
+    assert result.returncode == 0, result.stderr
+    assert f"Database:     {work_dir / 'mnemosyne.db'}" in result.stdout
+    assert _labels(work_dir / "mnemosyne.db") == ["restored"]
+    assert default_db.read_bytes() == default_bytes
+    assert other_db.read_bytes() == other_bytes
+
+
+def test_cli_backup_of_existing_bank_without_database_fails_before_writing(tmp_path):
+    data_dir = tmp_path / "data"
+    default_db = _make_store(data_dir / "mnemosyne.db", "default")
+    (data_dir / "banks" / "work").mkdir(parents=True)
+    default_bytes = default_db.read_bytes()
+
+    result = _run_cli(["backup"], tmp_path, data_dir, "work")
+
+    assert result.returncode == 2
+    assert "Database for bank 'work' does not exist" in result.stderr
+    assert not (tmp_path / "backups").exists()
+    assert list((data_dir / "banks" / "work").iterdir()) == []
+    assert default_db.read_bytes() == default_bytes
+
+
+@pytest.mark.parametrize("command", ["backup", "restore"])
+def test_cli_unknown_bank_does_not_create_missing_data_root(tmp_path, command):
+    data_dir = tmp_path / "data"
+    backup = _snapshot(tmp_path)
+    source = Path(backup["source_db"])
+    source_bytes = source.read_bytes()
+    args = ["backup"] if command == "backup" else ["restore", backup["backup_path"]]
+
+    result = _run_cli(args, tmp_path, data_dir, "nope")
+
+    assert result.returncode == 2
+    assert "Bank 'nope' does not exist" in result.stderr
+    assert not data_dir.exists()
+    assert not (tmp_path / "backups").exists()
+    assert source.read_bytes() == source_bytes
