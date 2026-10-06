@@ -90,6 +90,7 @@ def test_import_module_restores_prior_package_identity():
     swapped mnemosyne_hermes in and out of sys.modules.
     """
     import mnemosyne_hermes as pre_import
+    import mnemosyne_hermes.cli as pre_cli
 
     before = sys.modules["mnemosyne_hermes"]
     _import_module("mnemosyne_hermes", INTEGRATION_SRC)
@@ -97,6 +98,7 @@ def test_import_module_restores_prior_package_identity():
 
     assert after is before
     assert pre_import is sys.modules["mnemosyne_hermes"]
+    assert pre_cli is sys.modules["mnemosyne_hermes.cli"]
 
 
 def _write_mnemosyne_config(hermes_home: Path, tools) -> None:
@@ -2241,18 +2243,18 @@ def test_packaged_provider_import_survives_missing_core_helpers():
     sys.path.insert(0, str(INTEGRATION_SRC))
     sys.meta_path.insert(0, finder)
     try:
-        module = importlib.import_module("mnemosyne_hermes")
-    finally:
-        sys.meta_path.remove(finder)
         try:
-            sys.path.remove(str(INTEGRATION_SRC))
-        except ValueError:
-            pass
-        for name in blocked:
-            sys.modules.pop(name, None)
-        sys.modules.update(saved)
+            module = importlib.import_module("mnemosyne_hermes")
+        finally:
+            sys.meta_path.remove(finder)
+            try:
+                sys.path.remove(str(INTEGRATION_SRC))
+            except ValueError:
+                pass
+            for name in blocked:
+                sys.modules.pop(name, None)
+            sys.modules.update(saved)
 
-    try:
         assert module.read_hermes_config_key(None, "tools") is None
         with pytest.raises(module.BatchValidationError):
             module.validate_batch_operations([])
