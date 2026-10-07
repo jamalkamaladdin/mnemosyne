@@ -22,7 +22,7 @@ import json
 import hashlib
 import threading
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from mnemosyne.core._connection_gc import collect_connection_cycles
 from mnemosyne.core.config import resolve_beam_runtime
@@ -33,7 +33,7 @@ from mnemosyne.core.sqlite_config import configure_busy_timeout
 
 logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional, Any, Set, Union, Tuple, Callable, Sequence
+from typing import List, Dict, Optional, Any, Set, Union, Tuple, Callable, Sequence, FrozenSet
 from pathlib import Path
 
 
@@ -3290,7 +3290,7 @@ def _symbolic_code_tokens(text: str) -> List[str]:
     return list(dict.fromkeys(_SYMBOLIC_CODE_RE.findall(text.lower())))
 
 
-def _component_unit_weight(components: List[str]) -> int:
+def _component_unit_weight(components: Sequence[str]) -> int:
     """Return the lexical-unit weight for a token's hyphen components."""
     return len(components) if len(components) >= 2 else 1
 
@@ -3453,20 +3453,92 @@ def _cjk_fts_terms(text: str) -> List[str]:
     return terms
 
 
-def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str = "") -> float:
-    """Conservative lexical score in [0, 1]. Returns 0 for no real token overlap.
+@dataclass(frozen=True)
+class _LexicalQuery:
+    """Query side of ``_lexical_relevance()``, prepared once per recall.
 
-    This replaces the old character-overlap fallback for normal spaced text.
-    Character overlap is only useful for CJK/spaceless text; in English it made
-    nonsense queries retrieve unrelated high-importance memories.
+    None of these fields depend on the candidate row. Deriving them inside
+    the per-row scorer re-scanned the whole query string for every row, and
+    the Hangul check on ``query_lower`` ran once per unmatched token per row,
+    so a multi-KB query stalled recall for seconds (#1124).
     """
-    content_lower = content.lower()
+
+    query_lower: str
+    tokens: Tuple[str, ...]
+    token_set: FrozenSet[str]
+    component_groups: Tuple[Tuple[str, ...], ...]
+    token_has_hangul: Tuple[bool, ...]
+    lexical_unit_count: int
+    query_cjk: FrozenSet[str]
+    short_stems: FrozenSet[str]
+    has_hangul: bool
+    has_cyrillic: bool
+    # 4-character grams per query token, filled on first use by
+    # ``_substring_overlap()``. Total size is bounded by the query length.
+    grams: Dict[str, FrozenSet[str]] = field(default_factory=dict, compare=False)
+
+    @property
+    def matchable(self) -> bool:
+        """False when no row can score above 0.0 for this query."""
+        return bool(self.tokens or self.query_cjk)
+
+
+@dataclass(frozen=True)
+class _LexicalContent:
+    """Content side of ``_lexical_relevance()``; independent of the query.
+
+    ``base_tokens`` is ``set(_recall_tokens(content_lower))``, the set the
+    working-memory multi-hit pre-pass needs, so one preparation serves both
+    that pass and the score of the same row.
+    """
+
+    content_lower: str
+    base_tokens: FrozenSet[str]
+    tokens: FrozenSet[str]
+    # Tokens of 4+ characters: NUL-joined, and indexed by their first four
+    # characters. No recall token contains NUL, so ``token in long_joined``
+    # holds exactly when the token sits inside one of them.
+    long_tokens: FrozenSet[str]
+    long_joined: str
+    long_by_prefix: Dict[str, Tuple[str, ...]]
+    long_prefixes: FrozenSet[str]
+
+
+def _substring_overlap(query: "_LexicalQuery", token: str, content: "_LexicalContent") -> bool:
+    """``any(token in c or c in token for c in content tokens if len(c) >= 4)``.
+
+    ``c in token`` needs ``c[:4]`` among the 4-character grams of ``token``,
+    so only content tokens under a shared gram are compared.
+    """
+    if "\0" in token:
+        return any(
+            token in ctoken or ctoken in token for ctoken in content.long_tokens
+        )
+    if token in content.long_joined:
+        return True
+    grams = query.grams.get(token)
+    if grams is None:
+        grams = query.grams[token] = frozenset(
+            token[start:start + 4] for start in range(len(token) - 3)
+        )
+    if grams.isdisjoint(content.long_prefixes):
+        return False
+    return any(
+        ctoken in token
+        for gram in grams.intersection(content.long_prefixes)
+        for ctoken in content.long_by_prefix[gram]
+    )
+
+
+def _prepare_lexical_query(query_tokens: Sequence[str], query_lower: str = "") -> _LexicalQuery:
+    """Build the row-independent inputs of ``_lexical_relevance()``."""
     query_cjk = {
         ch for ch in query_lower
         if "\u4e00" <= ch <= "\u9fff"
         or "\u3040" <= ch <= "\u30ff"
         or "\uac00" <= ch <= "\ud7af"
     }
+    query_tokens = list(query_tokens)
     if query_lower:
         query_tokens = [*query_tokens, *_hyphen_fragment_tokens(query_lower)]
         query_tokens = [*query_tokens, *_symbolic_code_tokens(query_lower)]
@@ -3489,16 +3561,48 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
         # characters live inside the tokens, so nothing is dropped.
         token_chars = {ch for token in query_tokens for ch in token}
         query_cjk &= token_chars
-    if not query_tokens and not query_cjk:
-        return 0.0
     # Callers pass raw _recall_tokens() output. Count each compound's
     # meaningful components as separate lexical units so they can match a
     # differently-hyphenated fact without outweighing the rest of the query.
-    component_groups = [_hyphen_components(token) for token in query_tokens]
+    component_groups = tuple(
+        tuple(_hyphen_components(token)) for token in query_tokens
+    )
     lexical_unit_count = sum(
         _component_unit_weight(components) for components in component_groups
     )
-    content_tokens = set(_recall_tokens(content_lower))
+    # `_recall_tokens()` reads its length floor off the surface form and then
+    # strips the particle that earned it: `AI가` clears the two-character
+    # Hangul floor and leaves `ai`, while a standalone `AI` in the content is
+    # measured against the three-character Latin floor and dropped. The two
+    # sides disagree about the same word. `_fts_query_terms()` emits `"ai"*`
+    # either way, so admission has to be able to credit a stem the query
+    # actually asked for -- otherwise `_fts_search()` returns the row as its
+    # top candidate and `recall()` scores it below the gate. Only stems the
+    # query names are admitted, so the global precision gates that share
+    # `_recall_tokens()` keep their current floor.
+    short_stems = frozenset(
+        token for token in query_tokens
+        if len(token) < 3 and not _has_hangul(token)
+    )
+    return _LexicalQuery(
+        query_lower=query_lower,
+        tokens=tuple(query_tokens),
+        token_set=frozenset(query_tokens),
+        component_groups=component_groups,
+        token_has_hangul=tuple(_has_hangul(token) for token in query_tokens),
+        lexical_unit_count=lexical_unit_count,
+        query_cjk=frozenset(query_cjk),
+        short_stems=short_stems,
+        has_hangul=_has_hangul(query_lower),
+        has_cyrillic=_has_cyrillic(query_lower),
+    )
+
+
+def _prepare_lexical_content(content: str) -> _LexicalContent:
+    """Build the query-independent token sets of one candidate's content."""
+    content_lower = content.lower()
+    base_tokens = frozenset(_recall_tokens(content_lower))
+    content_tokens = set(base_tokens)
     # Leading-hyphen fragments are invisible to _recall_tokens() (a token
     # must start with a word character); admit their components on both
     # sides so shell-style queries like "rm -rf" are not silently missed.
@@ -3519,35 +3623,77 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
             part for part in re.split(r"[_:/.-]+", token)
             if _is_meaningful_recall_token(part)
         )
-    content_tokens = expanded_content_tokens
-    # `_recall_tokens()` reads its length floor off the surface form and then
-    # strips the particle that earned it: `AI가` clears the two-character
-    # Hangul floor and leaves `ai`, while a standalone `AI` in the content is
-    # measured against the three-character Latin floor and dropped. The two
-    # sides disagree about the same word. `_fts_query_terms()` emits `"ai"*`
-    # either way, so admission has to be able to credit a stem the query
-    # actually asked for -- otherwise `_fts_search()` returns the row as its
-    # top candidate and `recall()` scores it below the gate. Only stems the
-    # query names are admitted, so the global precision gates that share
-    # `_recall_tokens()` keep their current floor.
-    short_stems = {
-        token for token in query_tokens
-        if len(token) < 3 and not _has_hangul(token)
-    }
-    if short_stems:
-        content_tokens.update(
-            short_stems.intersection(_RECALL_TOKEN_RE.findall(content_lower))
+    long_tokens = frozenset(t for t in expanded_content_tokens if len(t) >= 4)
+    long_by_prefix: Dict[str, List[str]] = {}
+    for long_token in long_tokens:
+        long_by_prefix.setdefault(long_token[:4], []).append(long_token)
+    return _LexicalContent(
+        content_lower=content_lower,
+        base_tokens=base_tokens,
+        tokens=frozenset(expanded_content_tokens),
+        long_tokens=long_tokens,
+        long_joined="\0".join(long_tokens),
+        long_by_prefix={
+            prefix: tuple(group) for prefix, group in long_by_prefix.items()
+        },
+        long_prefixes=frozenset(long_by_prefix),
+    )
+
+
+def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str = "") -> float:
+    """Conservative lexical score in [0, 1]. Returns 0 for no real token overlap.
+
+    This replaces the old character-overlap fallback for normal spaced text.
+    Character overlap is only useful for CJK/spaceless text; in English it made
+    nonsense queries retrieve unrelated high-importance memories.
+
+    One-shot form. ``recall()`` prepares the query once and each candidate's
+    content once, then calls ``_prepared_lexical_relevance()``; both forms
+    return the same float.
+    """
+    return _lexical_relevance_for_query(
+        _prepare_lexical_query(query_tokens, query_lower), content
+    )
+
+
+def _lexical_relevance_for_query(query: _LexicalQuery, content: str) -> float:
+    """Score raw ``content`` against a prepared query.
+
+    Content is tokenized only when the query can match at all, so an
+    unmatchable query costs nothing per row.
+    """
+    if not query.matchable:
+        return 0.0
+    return _prepared_lexical_relevance(query, _prepare_lexical_content(content))
+
+
+def _prepared_lexical_relevance(query: _LexicalQuery, content: _LexicalContent) -> float:
+    """``_lexical_relevance()`` over a prepared query and prepared content."""
+    query_tokens = query.tokens
+    query_lower = query.query_lower
+    query_cjk = query.query_cjk
+    content_lower = content.content_lower
+    if not query.matchable:
+        return 0.0
+    content_tokens = content.tokens
+    if query.short_stems:
+        stem_hits = query.short_stems.intersection(
+            _RECALL_TOKEN_RE.findall(content_lower)
         )
+        if stem_hits:
+            content_tokens = content_tokens | stem_hits
     if not content_tokens and not query_cjk:
         return 0.0
-
+    lexical_unit_count = query.lexical_unit_count
     exact = 0.0
     partial = 0.0
-    for token, components in zip(query_tokens, component_groups, strict=True):
+    for token, components, token_has_hangul in zip(
+        query_tokens, query.component_groups, query.token_has_hangul, strict=True
+    ):
         if token in content_tokens:
             exact += _component_unit_weight(components)
             continue
-        if _has_hangul(token) and any(
+        if token_has_hangul and any(
             ctoken.startswith(token) for ctoken in content_tokens
         ):
             # Korean inflects by suffixing, and `_strip_ko_josa()` trims only
@@ -3604,16 +3750,12 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
             # `lifecycle` reaches `lifecycle.log` only here. FTS5 does cut
             # on those characters, so candidate generation still returns
             # the row and its remaining tokens carry it over the gate.
-            and not (_has_hangul(query_lower) and not _has_hangul(token))
-            and any(
-                token in ctoken or ctoken in token
-                for ctoken in content_tokens
-                if len(ctoken) >= 4
-            )
+            and not (query.has_hangul and not token_has_hangul)
+            and _substring_overlap(query, token, content)
         ):
             partial += 0.4
 
-    if _has_hangul(query_lower):
+    if query.has_hangul:
         # A raw substring test has no token boundary, so `바나나` "fully
         # matches" `바나나우유` and the bonus alone saturates `score` at the
         # 1.0 cap -- hiding the prefix discount above and tying the compound
@@ -3627,7 +3769,7 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
         # Requiring the normalized tokens instead keeps the bonus where it was
         # earned and drops it where it was an artifact.
         full_match = (
-            1.0 if query_tokens and set(query_tokens) <= content_tokens else 0.0
+            1.0 if query_tokens and query.token_set <= content_tokens else 0.0
         )
     else:
         full_match = 1.0 if query_lower and query_lower in content_lower else 0.0
@@ -3642,7 +3784,7 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
                 or "\uac00" <= ch <= "\ud7af"
             }
             score = len(query_cjk & content_cjk) / len(query_cjk)
-        elif _has_cyrillic(query_lower):
+        elif query.has_cyrillic:
             # Cyrillic inflected forms (тёмная/тёмную, резервная/резервное)
             # defeat exact token matching. _cyrillic_score uses trigram
             # Jaccard, which handles inflection correctly. The scoring
@@ -9130,6 +9272,9 @@ class BeamMemory:
         results = []
         query_lower = query.lower()
         query_words = _recall_tokens(query_lower)
+        # Row-independent half of `_lexical_relevance()`, built once for every
+        # tier this call scores instead of once per candidate row (#1124).
+        lexical_query = _prepare_lexical_query(query_words, query_lower)
         query_has_literal_flag = bool(_leading_hyphen_fragments(query_lower))
         literal_candidate_content: Dict[tuple[str, str], str] = {}
 
@@ -9398,17 +9543,28 @@ class BeamMemory:
         min_relevance = _minimum_recall_relevance(query_words)
         single_token_relevance = 1.0 / max(len(query_words), 1)
         matched_query_tokens: Set[str] = set()
-        if len(query_words) >= 4:
-            query_word_set = set(query_words)
-            for candidate_row in rows:
+        multi_hit_word_set = set(query_words) if len(query_words) >= 4 else None
+        # One content preparation per row serves both the multi-hit pre-pass
+        # and the score of that row below. An unmatchable query scores every
+        # row 0.0 without tokenizing any content.
+        wm_lexical: List[float] = []
+        for candidate_row in rows:
+            if not lexical_query.matchable:
+                wm_lexical.append(0.0)
+                continue
+            candidate_content = _prepare_lexical_content(candidate_row["content"])
+            wm_lexical.append(
+                _prepared_lexical_relevance(lexical_query, candidate_content)
+            )
+            if multi_hit_word_set is not None:
                 matched_query_tokens.update(
-                    query_word_set & set(_recall_tokens(candidate_row["content"].lower()))
+                    multi_hit_word_set & candidate_content.base_tokens
                 )
         broad_multi_hit_query = len(query_words) >= 4 and len(matched_query_tokens) >= 2
-        for row in rows:
+        for row, row_lexical in zip(rows, wm_lexical, strict=True):
             if wm_ranks and row["id"] in wm_ranks:
                 normalized = 1.0 - ((wm_ranks[row["id"]] - min_rank) / rng)
-                lexical = _lexical_relevance(query_words, row["content"], query_lower)
+                lexical = row_lexical
                 # FTS rank is a candidate-order signal, not a hard relevance
                 # ceiling. Multi-fact queries can legitimately need several
                 # different rows. If several distinct query terms match across
@@ -9418,7 +9574,7 @@ class BeamMemory:
                 row_min_relevance = single_token_relevance if broad_multi_hit_query else min_relevance
                 relevance = max(lexical, (0.75 * lexical + 0.25 * normalized)) if lexical >= row_min_relevance else 0.0
             else:
-                relevance = _lexical_relevance(query_words, row["content"], query_lower)
+                relevance = row_lexical
                 row_min_relevance = single_token_relevance if broad_multi_hit_query else min_relevance
             vec_sim = wm_vec_sims.get(row["id"], 0.0)
             if (
@@ -9917,7 +10073,7 @@ class BeamMemory:
             binary_bonus = 0.0
             memory_id = row["id"]
             bv = row["binary_vector"]
-            lexical = _lexical_relevance(query_words, row["content"], query_lower)
+            lexical = _lexical_relevance_for_query(lexical_query, row["content"])
             # FTS rank says a candidate matched *a* term; it does not mean the
             # candidate answers a broad natural-language query. Require enough
             # lexical coverage before admitting FTS-only episodic rows, while
@@ -10032,7 +10188,7 @@ class BeamMemory:
             # relevance>0.02 threshold) so the counter reflects
             # results-attributable contributions, not scanned rows.
             for row in _em_fallback_rows:
-                relevance = _lexical_relevance(query_words, row["content"], query_lower)
+                relevance = _lexical_relevance_for_query(lexical_query, row["content"])
                 if relevance >= min_relevance:
                     decay = _recency_decay(row["timestamp"])
                     # Phase 4: configurable scoring for episodic fallback
@@ -10225,7 +10381,7 @@ class BeamMemory:
             _memoria_result = self.memoria_retrieve(query, top_k=3)
             if _memoria_result and _memoria_result.get("source") != "fallback":
                 _ctx = _memoria_result.get("context", "")
-                _memoria_relevance = _lexical_relevance(query_words, _ctx, query_lower)
+                _memoria_relevance = _lexical_relevance_for_query(lexical_query, _ctx)
                 if _ctx and _memoria_relevance >= 0.35:
                     results.append({
                         "id": f"memoria_{_memoria_result['source']}",
