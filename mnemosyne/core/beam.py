@@ -22,6 +22,7 @@ import json
 import hashlib
 import threading
 import math
+import operator
 from dataclasses import dataclass, field
 
 from mnemosyne.core._connection_gc import collect_connection_cycles
@@ -4333,10 +4334,22 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     disk headroom on a large store.
 
     ``dry_run`` returns the plan (model, dim, per-store counts) without writing.
+    ``batch_size`` must support the integer index protocol (not a bool) and be
+    positive, including for dry-run.
+    Lower it for embedding endpoints with a per-request input cap; default 64.
     ``progress`` is an optional ``callable(store, done, total)`` for reporting.
     It fires after each embedded batch, before the commit, so a count it
     reports is not durable until the function returns.
     """
+    if isinstance(batch_size, bool):
+        raise ValueError("batch_size must be a positive integer")
+    try:
+        batch_size = operator.index(batch_size)
+    except TypeError as exc:
+        raise ValueError("batch_size must be a positive integer") from exc
+    if batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+
     target_dim = int(_embeddings.EMBEDDING_DIM)
     vec_type = _effective_vec_type(conn)
     vec_ok = _vec_available(conn)
@@ -6990,12 +7003,20 @@ class BeamMemory:
             owns_transaction = not self.conn.in_transaction
 
             def validate_and_invalidate() -> bool:
-                now = datetime.now().isoformat()
+                now = datetime.now(timezone.utc).isoformat()
                 # Both the replacement and the target must still be ACTIVE
                 # (not superseded, not expired): a concurrent resolver may have
                 # superseded either between our scan and this write, and we must
                 # not overwrite an existing successor.
-                active = "AND superseded_by IS NULL AND (valid_until IS NULL OR valid_until > ?)"
+                # ``julianday`` parses offset-bearing values chronologically:
+                # a lexical ``>`` would judge ``18:30+07:00`` (11:30Z, already
+                # expired) later than a naive ``12:00`` now because its digits
+                # sort after it. Same predicate shape as the julianday-based
+                # surfaces above.
+                active = (
+                    "AND superseded_by IS NULL "
+                    "AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))"
+                )
                 replacement_found = False
                 for table in ("working_memory", "episodic_memory"):
                     cursor.execute(
@@ -13234,7 +13255,7 @@ class BeamMemory:
         max_llm_validations = max(1, int(max_llm_validations))
 
         cursor = self.conn.cursor()
-        now = datetime.now().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
 
         rows = []
         truncated = False
@@ -13248,7 +13269,7 @@ class BeamMemory:
                     f"SELECT id, content, source, timestamp, scope, session_id, superseded_by "
                     f"FROM {table} WHERE scope = 'global' "
                     f"AND superseded_by IS NULL "
-                    f"AND (valid_until IS NULL OR valid_until > ?) "
+                    f"AND (valid_until IS NULL OR julianday(valid_until) > julianday(?)) "
                     f"ORDER BY timestamp ASC LIMIT ?",
                     (now, max_candidates + 1),
                 )
