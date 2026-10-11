@@ -543,7 +543,19 @@ CROSS_SESSION_RESOLVE_SCHEMA = {
         "properties": {
             "dry_run": {
                 "type": "boolean",
-                "description": "If true, report what would be resolved without writing changes.",
+                "description": "If true, preview resolution without superseding memories or emitting an apply audit. LLM evaluation may still write cost records.",
+                "default": False,
+            },
+            "llm_eval": {
+                "type": "boolean",
+                "description": (
+                    "Only meaningful with dry_run=true: run LLM verification on "
+                    "flagged pairs without superseding memories. Can incur costs "
+                    "and write cost records; reserves one reflection call and "
+                    "obeys cron/budget guards. Overrides the LLM detection flag "
+                    "for preview, not the cross-session gate. Default false "
+                    "keeps the dry run deterministic (no LLM calls or reservation)."
+                ),
                 "default": False,
             },
         },
@@ -3162,11 +3174,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def _handle_resolve_conflicts(self, args: Dict[str, Any]) -> str:
         """Invoke the opt-in cross-session conflict resolver.
 
-        `dry_run=True` reports candidate pairs without mutating; `dry_run=False`
-        applies supersessions. The apply path reserves the reflection budget (it
-        can issue one LLM validation request per flagged pair when
-        `MNEMOSYNE_LLM_CONFLICT_DETECTION` is on)."""
+        `dry_run=True` previews without superseding memories or apply audits.
+        Explicit `llm_eval=True` can call the LLM and write cost records even
+        when the LLM detection flag is off. Apply and evaluated preview reserve
+        one reflection call before core execution, without refunds."""
         dry_run = bool(args.get("dry_run", False))
+        llm_eval = bool(args.get("llm_eval", False))
         if not hasattr(self._beam, "resolve_cross_session_conflicts"):
             return json.dumps({
                 "status": "unavailable",
@@ -3175,12 +3188,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Apply can issue one LLM validation request per flagged pair when
         # MNEMOSYNE_LLM_CONFLICT_DETECTION is on; reserve the reflection budget
         # like _handle_sleep does for the same class of work. Dry runs are
-        # deterministic and make no LLM calls, so they need no budget.
-        if not dry_run:
+        # deterministic and make no LLM calls unless llm_eval is requested.
+        if not dry_run or llm_eval:
             skip = self._reserve_reflection_budget("tool")
             if skip is not None:
                 return json.dumps(skip)
-        result = self._beam.resolve_cross_session_conflicts(dry_run=dry_run)
+        result = self._beam.resolve_cross_session_conflicts(
+            dry_run=dry_run,
+            llm_eval=llm_eval,
+        )
         if not dry_run and int(result.get("invalidated", 0)):
             try:
                 self._audit_event(
@@ -3202,6 +3218,47 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         episodic = self._beam.get_episodic_stats()
         memoria = self._beam.get_memoria_stats()
         return json.dumps({"provider": "mnemosyne", "session_id": self._session_id, "working": working, "episodic": episodic, "memoria": memoria})
+
+    def _invalidate_target_active(self, beam: Any, memory_id: str) -> bool:
+        """True when `memory_id` is still an ACTIVE row for this beam.
+
+        BeamMemory.invalidate() refuses to touch a row that is superseded or
+        expired, while BeamMemory.get() happily returns such rows too — so a
+        failed invalidation can only blame the replacement when the target
+        itself still passes core's visibility predicate. Mirrors exactly that
+        predicate. When the query cannot run, only a get() row that POSITIVELY
+        declares both status fields unset counts as active: the real
+        BeamMemory.get() shape omits superseded_by/valid_until entirely, and
+        absent fields mean UNKNOWN, not active. An unknown state fails closed
+        (memory_not_found) rather than blaming a healthy replacement.
+        """
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            cursor = beam.conn.cursor()
+            for table in ("working_memory", "episodic_memory"):
+                cursor.execute(
+                    f"SELECT 1 FROM {table} "
+                    "WHERE id = ? AND (session_id = ? OR scope = 'global') "
+                    "AND superseded_by IS NULL "
+                    "AND (valid_until IS NULL OR julianday(valid_until) > julianday(?)) LIMIT 1",
+                    (memory_id, getattr(beam, "session_id", None), now),
+                )
+                if cursor.fetchone() is not None:
+                    return True
+            return False
+        except Exception:
+            # Degraded path — see the contract above: activity is only
+            # claimed when the row declares it, never inferred from absent
+            # fields (review on #1113, third round).
+            try:
+                row = beam.get(memory_id)
+            except Exception:
+                return False
+            if row is None:
+                return False
+            if "superseded_by" not in row or "valid_until" not in row:
+                return False
+            return not row["superseded_by"] and not row["valid_until"]
 
     def _handle_invalidate(self, args: Dict[str, Any]) -> str:
         memory_id = args.get("memory_id", "")
@@ -3242,10 +3299,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             metadata={"replacement_id": replacement_id, "invalidated": ok} if replacement_id else {"invalidated": ok},
         )
         if not ok:
-            if replacement_id and target_beam.get(memory_id) is not None:
-                # The target is visible in this bank, so the only remaining
-                # reason the invalidation can fail is that the replacement id
-                # is not visible there. Tell the caller which id to correct.
+            if replacement_id and self._invalidate_target_active(target_beam, memory_id):
+                # The target is still an ACTIVE row in this bank, so the only
+                # remaining reason the invalidation can fail is that the
+                # replacement id is not an active row there. Tell the caller
+                # which id to correct. (A bare get() cannot decide this: it
+                # also returns superseded and expired rows, which would let
+                # an inactive target wrongly blame a healthy replacement.)
                 return json.dumps({
                     "status": "replacement_not_found",
                     "memory_id": memory_id,
