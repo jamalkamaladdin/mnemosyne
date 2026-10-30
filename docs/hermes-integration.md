@@ -510,7 +510,7 @@ target = home / "plugins" / "mnemosyne"
 backup = home / "mnemosyne-legacy-plugin-backup"
 if target.parent.is_symlink() or target.is_symlink() or not target.is_dir():
     raise SystemExit("Not a local per-file directory; no changes made")
-if (home / "plugins" / "hermes-mnemosyne").exists():
+if (home / "plugins" / "hermes-mnemosyne").exists() or (home / "plugins" / "hermes-mnemosyne").is_symlink():
     raise SystemExit("Old plugin path also exists; inspect it first")
 if backup.exists() or backup.is_symlink():
     raise SystemExit("Backup already exists; inspect it first")

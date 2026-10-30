@@ -17,6 +17,63 @@ import pytest
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX legacy symlink layout")
+def test_dangling_legacy_plugin_link_refuses_without_install(tmp_path):
+    guide = (Path(__file__).resolve().parents[3] / "docs" / "hermes-integration.md").read_text()
+    section = guide.split("#### Recover a legacy per-file plugin directory", 1)[1]
+    script = section.split("```bash\n", 1)[1].split("\n```", 1)[0]
+
+    package = tmp_path / "site" / "mnemosyne_hermes"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    home = tmp_path / "selected-home"
+    target = home / "plugins" / "mnemosyne"
+    target.mkdir(parents=True)
+    initializer = target / "__init__.py"
+    initializer.symlink_to(package / "__init__.py")
+    custom = target / "custom.txt"
+    custom.write_text("custom plugin data")
+    dangling = home / "plugins" / "hermes-mnemosyne"
+    missing = tmp_path / "custom-plugin" / "missing"
+    dangling.symlink_to(missing)
+    backup = home / "mnemosyne-legacy-plugin-backup"
+
+    installer_marker = tmp_path / "installer-reached"
+    python_wrapper = tmp_path / "gateway-python"
+    python_wrapper.write_text(
+        '#!/bin/sh\n'
+        'if [ "$1" = "-m" ] && [ "$2" = "mnemosyne_hermes.install" ]; then\n'
+        '  : > "$INSTALL_MARKER"\n'
+        '  exit 97\n'
+        'fi\n'
+        'exec "$REAL_PYTHON" "$@"\n'
+    )
+    python_wrapper.chmod(0o755)
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(tmp_path),
+        "HERMES_HOME": str(home),
+        "HERMES_PYTHON": str(python_wrapper),
+        "MNEMOSYNE_DATA_DIR": str(tmp_path / "data"),
+        "MNEMOSYNE_NO_EMBEDDINGS": "1",
+        "PYTHONPATH": str(package.parent),
+        "REAL_PYTHON": sys.executable,
+        "INSTALL_MARKER": str(installer_marker),
+    }
+    refused = subprocess.run(
+        ["bash", "-c", script], env=env, cwd=tmp_path,
+        text=True, capture_output=True, timeout=90,
+    )
+    assert refused.returncode != 0, (refused.stdout, refused.stderr)
+    assert "Old plugin path also exists; inspect it first" in refused.stderr
+    assert not installer_marker.exists()
+    assert target.is_dir() and not target.is_symlink()
+    assert initializer.is_symlink() and initializer.resolve() == package / "__init__.py"
+    assert custom.read_text() == "custom plugin data"
+    assert dangling.is_symlink() and os.readlink(dangling) == str(missing)
+    assert not backup.exists() and not backup.is_symlink()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX legacy symlink layout")
 def test_legacy_wheel_upgrade_and_owned_layout_recovery(tmp_path):
     source = os.environ.get("HERMES_AGENT_SOURCE")
     wheel_dir = os.environ.get("MNEMOSYNE_LEGACY_WHEELS")
