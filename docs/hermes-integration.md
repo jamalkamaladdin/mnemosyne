@@ -492,7 +492,7 @@ Do not link individual package files. An upgrade can add a relative import witho
 
 This recovery is only for an existing directory of per-file links into the **same** installed `mnemosyne_hermes` package, in an explicitly selected Hermes home. First determine the actual active `HERMES_HOME` and gateway Python using the installation route above; a PM-managed environment or shared install needs its own owner-approved package update before this step. Do not infer either path from the shell, a build venv or a profile name. Stop if the provider is a directory symlink, a wrapper, a foreign/custom plugin, or has profile-local plugin targets; handle those separately without deleting them. Never use `install --force` on this legacy directory: it can remove its contents.
 
-Export both variables to the verified paths, then run the following block once. The subshell stops on any failed check, install or status command without changing the caller's shell options. It checks ownership of every per-file link and moves the entire old directory to a backup before invoking the installer. Regular custom files remain in that backup, not in the new package link. An existing backup blocks the operation.
+Export both variables to the verified paths, then run the following block once. The subshell stops on any failed check, install or status command without changing the caller's shell options. It checks ownership of every per-file link and moves the entire old directory to a backup **outside** the plugin discovery tree before invoking the installer. Regular custom files remain in that backup, not in the new package link. An existing backup blocks the operation.
 
 ```bash
 (
@@ -507,7 +507,7 @@ import mnemosyne_hermes
 home = Path(os.environ["HERMES_HOME"]).expanduser().resolve(strict=True)
 package = Path(mnemosyne_hermes.__file__).resolve().parent
 target = home / "plugins" / "mnemosyne"
-backup = home / "plugins" / "mnemosyne.legacy-backup"
+backup = home / "mnemosyne-legacy-plugin-backup"
 if target.parent.is_symlink() or target.is_symlink() or not target.is_dir():
     raise SystemExit("Not a local per-file directory; no changes made")
 if (home / "plugins" / "hermes-mnemosyne").exists():

@@ -128,7 +128,7 @@ print("provider constructed, captured, remembered and recalled")
     hermes_stub.chmod(0o755)
     env["PATH"] = str(bin_dir) + os.pathsep + env["PATH"]
     env["HERMES_PYTHON"] = sys.executable
-    backup = home / "plugins" / "mnemosyne.legacy-backup"
+    backup = home / "mnemosyne-legacy-plugin-backup"
     foreign = target / "foreign-link.txt"
     foreign.symlink_to(other_home / "plugins" / "mnemosyne" / "custom.txt")
     refused = subprocess.run(
@@ -167,8 +167,23 @@ print("provider constructed, captured, remembered and recalled")
     )
     assert recovered.returncode == 0, recovered.stderr
     assert "Installed. Symlink" in recovered.stdout
-    assert backup.is_dir()
+    assert backup.is_dir() and backup.parent != target.parent
     assert (backup / "custom.txt").read_text() == "keep custom data"
+    discovery = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from plugins.memory import list_memory_provider_names; print(list_memory_provider_names())",
+        ],
+        env=env,
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        timeout=90,
+    )
+    assert discovery.returncode == 0, discovery.stderr
+    assert "mnemosyne-legacy-plugin-backup" not in discovery.stdout
+    assert "mnemosyne" in discovery.stdout
     assert target.is_symlink() and target.resolve() == package
     assert (backup / "custom.txt").read_text() == "keep custom data"
     assert (other_home / "plugins" / "mnemosyne" / "custom.txt").read_text() == "other profile"
