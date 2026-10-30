@@ -120,12 +120,19 @@ print("provider constructed, captured, remembered and recalled")
     # including its refusal paths, rather than duplicating its safety logic.
     guide = (Path(__file__).resolve().parents[3] / "docs" / "hermes-integration.md").read_text()
     section = guide.split("#### Recover a legacy per-file plugin directory", 1)[1]
-    preflight = section.split("\"$HERMES_PYTHON\" - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    script = section.split("```bash\n", 1)[1].split("\n```", 1)[0]
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    hermes_stub = bin_dir / "hermes"
+    hermes_stub.write_text('#!/bin/sh\n[ "$1" = memory ] && [ "$2" = status ]\n')
+    hermes_stub.chmod(0o755)
+    env["PATH"] = str(bin_dir) + os.pathsep + env["PATH"]
+    env["HERMES_PYTHON"] = sys.executable
     backup = home / "plugins" / "mnemosyne.legacy-backup"
     foreign = target / "foreign-link.txt"
     foreign.symlink_to(other_home / "plugins" / "mnemosyne" / "custom.txt")
     refused = subprocess.run(
-        [sys.executable, "-c", preflight],
+        ["bash", "-c", script],
         env=env,
         cwd=tmp_path,
         text=True,
@@ -139,7 +146,7 @@ print("provider constructed, captured, remembered and recalled")
     profile.mkdir(parents=True)
     (profile / "owned.txt").write_text("profile artifact")
     refused = subprocess.run(
-        [sys.executable, "-c", preflight],
+        ["bash", "-c", script],
         env=env,
         cwd=tmp_path,
         text=True,
@@ -151,7 +158,7 @@ print("provider constructed, captured, remembered and recalled")
     profile.rename(other_home / "profile-artifact")
 
     recovered = subprocess.run(
-        [sys.executable, "-c", preflight],
+        ["bash", "-c", script],
         env=env,
         cwd=tmp_path,
         text=True,
@@ -159,34 +166,9 @@ print("provider constructed, captured, remembered and recalled")
         timeout=90,
     )
     assert recovered.returncode == 0, recovered.stderr
-    assert not target.exists() and backup.is_dir()
+    assert "Installed. Symlink" in recovered.stdout
+    assert backup.is_dir()
     assert (backup / "custom.txt").read_text() == "keep custom data"
-    installer = [
-        sys.executable,
-        "-m",
-        "mnemosyne_hermes.install",
-        "--hermes-home",
-        str(home),
-        "install",
-        "--mode",
-        "symlink",
-        "--python",
-        sys.executable,
-        "--no-profile-links",
-    ]
-    result = subprocess.run(
-        installer, env=env, cwd=tmp_path, text=True, capture_output=True, timeout=90
-    )
-    assert result.returncode == 0, result.stderr
-    status = subprocess.run(
-        [sys.executable, "-m", "mnemosyne_hermes.install", "--hermes-home", str(home), "status"],
-        env=env,
-        cwd=tmp_path,
-        text=True,
-        capture_output=True,
-        timeout=90,
-    )
-    assert status.returncode == 0, status.stderr
     assert target.is_symlink() and target.resolve() == package
     assert (backup / "custom.txt").read_text() == "keep custom data"
     assert (other_home / "plugins" / "mnemosyne" / "custom.txt").read_text() == "other profile"
