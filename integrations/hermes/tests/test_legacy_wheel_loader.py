@@ -82,22 +82,28 @@ provider = load_memory_provider("mnemosyne", register_skills=False)
 assert provider is not None, "real Hermes loader did not construct the provider"
 provider.initialize("wheel-upgrade-test", hermes_home=os.environ["HERMES_HOME"])
 assert provider._beam is not None
-provider.sync_turn("orchid capture from user", "I will retain the orchid capture in memory.",
+label = os.environ["LEGACY_PROBE_LABEL"]
+capture = f"orchid {label} capture from user"
+memory = f"orchid {label} ledger entry"
+provider.sync_turn(capture, f"I will retain the {label} orchid capture in memory.",
                    session_id="wheel-upgrade-test")
-assert any("[USER] orchid capture from user" in row[0]
+assert any(f"[USER] {capture}" in row[0]
            for row in provider._beam.conn.execute("SELECT content FROM working_memory"))
-written = json.loads(provider.handle_tool_call("mnemosyne_remember", {"content": "orchid ledger entry"}))
-assert written.get("status") != "memory_unavailable" and "error" not in written, written
-recalled = json.loads(provider.handle_tool_call("mnemosyne_recall", {"query": "orchid ledger", "limit": 5}))
+written = json.loads(provider.handle_tool_call("mnemosyne_remember", {"content": memory}))
+assert written.get("status") == "stored" and written.get("memory_id"), written
+assert any(row[0] == memory for row in provider._beam.conn.execute(
+    "SELECT content FROM working_memory")), written
+recalled = json.loads(provider.handle_tool_call("mnemosyne_recall", {"query": f"orchid {label} ledger", "limit": 5}))
 assert recalled.get("count", 0) > 0, recalled
-assert any("orchid ledger entry" in str(row) for row in recalled["results"]), recalled
+assert any(memory in str(row) for row in recalled["results"]), recalled
 print("provider constructed, captured, remembered and recalled")
 """
 
-    def load(expect_success):
+    def load(expect_success, label):
+        probe_env = {**env, "LEGACY_PROBE_LABEL": label}
         result = subprocess.run(
             [sys.executable, "-c", probe],
-            env=env,
+            env=probe_env,
             cwd=tmp_path,
             text=True,
             capture_output=True,
@@ -110,11 +116,11 @@ print("provider constructed, captured, remembered and recalled")
             assert result.returncode != 0, (result.stdout, result.stderr)
             assert "_verbatim_compat" in result.stderr
 
-    load(True)
+    load(True, "before-upgrade")
     install_wheel(wheel("mnemosyne_hermes", "0.7.0"), upgrade=True)
     assert (package / "_verbatim_compat.py").is_file()
     assert not (target / "_verbatim_compat.py").exists()
-    load(False)
+    load(False, "stale-layout")
 
     # Execute the documented ownership preflight against the upgraded wheel,
     # including its refusal paths, rather than duplicating its safety logic.
@@ -187,4 +193,4 @@ print("provider constructed, captured, remembered and recalled")
     assert target.is_symlink() and target.resolve() == package
     assert (backup / "custom.txt").read_text() == "keep custom data"
     assert (other_home / "plugins" / "mnemosyne" / "custom.txt").read_text() == "other profile"
-    load(True)
+    load(True, "after-recovery")
