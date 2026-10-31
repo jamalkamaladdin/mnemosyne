@@ -494,6 +494,8 @@ This recovery is only for an existing directory of per-file links into the **sam
 
 Export both variables to the verified paths, then run the following block once. The subshell stops on any failed check, install or status command without changing the caller's shell options. It checks ownership of every per-file link and moves the entire old directory to a backup **outside** the plugin discovery tree before invoking the installer. Regular custom files remain in that backup, not in the new package link. An existing backup blocks the operation.
 
+Before running the block, verify that `HERMES_PYTHON` imports the exact installed `mnemosyne_hermes` package that owns the legacy per-file links. A `mnemosyne-hermes` executable on `PATH`, or a provider installed only in a separate pipx environment, does not satisfy this prerequisite. Do not substitute the CLI interpreter without verifying ownership of those links.
+
 ```bash
 (
 set -e
